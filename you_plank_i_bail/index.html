@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hull Breach!</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; touch-action: none; user-select: none; -webkit-user-select: none; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+
+<script>
+/* =====================================================================
+   1. SETTINGS  –  tweak the game here
+   ===================================================================== */
+const CONFIG = {
+  TITLE: "Hull Breach!",
+  SUBTITLE: "Plug the cannonball holes before the ship floods.",
+
+  GAME_WIDTH: 1280,             // logical game size (the canvas scales to fit any screen)
+  GAME_HEIGHT: 720,
+
+  HOLE_SPAWN_INTERVAL_MS: 1500, // <<< HOW FAST HOLES SPAWN. Lower = faster (1000 = one per second)
+  HOLE_RADIUS_MIN: 48,          // hole size range, in pixels
+  HOLE_RADIUS_MAX: 72,
+  EDGE_PADDING: 40,             // keep holes this far from the screen edges
+
+  WATER_RISE_PER_HOLE_PER_SEC: 0.01, // each open hole raises the water by this fraction of the screen height per second
+                                      // Game over when the water reaches the top of the screen.
+  BUCKET_WATER_AMOUNT: 0.05,    // how much one full bucket removes from the water (fraction of screen height)
+  BUCKET: { w: 90, h: 100, startX: 130, startY: 590 }, // bucket size and starting spot, in pixels
+
+  WINDOW: { x: 486.5, y: 200, w: 307, h: 260 }, // window position/size in pixels (centered). No holes ever spawn here.
+
+  PLANK_WIDTH: 240,             // every plank is exactly this size (only the rotation is random)
+  PLANK_HEIGHT: 120,            // keep >= 2.3 x HOLE_RADIUS_MAX so a plank always covers a hole (the game also caps hole size to guarantee this)
+};
+
+/* =====================================================================
+   2. ASSETS  –  swap the look here
+   ---------------------------------------------------------------------
+   Every asset is drawn as simple shapes by default. To use your own art:
+     1. Put the image in an "assets" folder next to index.html
+     2. Set the asset's `image` to its path, e.g.  image: "assets/plank.png"
+     3. Set it back to null to go back to the basic shapes.
+
+   Image tips:
+     background : stretched to fill the whole screen (default 1280x720)
+     window     : stretched into the WINDOW rectangle from CONFIG above
+     hole       : drawn centered, squished into a square, so use a square image
+     plank      : stretched to the plank's size, so draw it LYING HORIZONTALLY
+                  (long side left-right). The game rotates it randomly.
+     bucketEmpty, bucketFull : stretched to the BUCKET size from CONFIG (default 90x100)
+     water      : draw it FULL SCREEN (1280x720); only the part below the
+                  waterline is shown, so it reveals as the water rises.
+   ===================================================================== */
+const ASSETS = {
+  background: { image: "assets/background.png", color: "#5a3820", showSeams: true, seamColor: "#472b18" },
+  window:     { image: "assets/window.png", frames: 133, fps: 8, color: "#8ecae6", frameColor: "#3b2314", barColor: "#3b2314" },
+  hole:       { image: "assets/hole.png", color: "#100904", rimColor: "#2e1a0c" },
+  plank:      { image: "assets/plank.png", color: "#b98450", edgeColor: "#6e4521", nailColor: "#3a3a3a" },
+  water:      { image: "assets/water.png", frames: 19, fps: 8, alpha: 0.5, color: "rgba(40,110,190,0.55)" },
+  bucketEmpty: { image: "assets/bucketEmpty.png", color: "#7d7d85", edgeColor: "#45454c", insideColor: "#2a2a30" },
+  bucketFull:  { image: "assets/bucketFull.png", color: "#7d7d85", edgeColor: "#45454c", waterColor: "#4aa3e8" },
+  ui: {  // text and button colors for the HUD, main menu and game over screen
+    text: "#fff3d6", font: "bold 28px sans-serif", titleFont: "bold 84px serif",
+    overlay: "rgba(0,0,0,0.55)",
+    buttonColor: "#b98450", buttonEdge: "#6e4521", buttonText: "#2b1608",
+  },
+};
+
+/* =====================================================================
+   3. GAME CODE  –  no need to touch this to change settings or assets
+   ===================================================================== */
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+const W = CONFIG.GAME_WIDTH, H = CONFIG.GAME_HEIGHT;
+
+// Load any custom images. If one fails to load, the basic shape is used instead.
+for (const a of Object.values(ASSETS)) {
+  a.img = null;
+  if (a.image) { const i = new Image(); i.onload = () => { a.img = i; }; i.src = a.image; }
+}
+
+// Scale the canvas to fit the window while keeping the aspect ratio
+function fit() {
+  const dpr = window.devicePixelRatio || 1;
+  const s = Math.min(innerWidth / W, innerHeight / H);
+  canvas.style.width = W * s + "px";
+  canvas.style.height = H * s + "px";
+  canvas.width = Math.round(W * s * dpr);
+  canvas.height = Math.round(H * s * dpr);
+  ctx.setTransform(canvas.width / W, 0, 0, canvas.height / H, 0, 0);
+}
+addEventListener("resize", fit);
+fit();
+
+const rand = (a, b) => a + Math.random() * (b - a);
+const interval = Math.max(50, CONFIG.HOLE_SPAWN_INTERVAL_MS);
+const holes = [];   // open holes
+const planks = [];  // placed planks, oldest first (so newer planks stack on top)
+let state = "menu"; // "menu" | "playing" | "gameover"
+let repaired = 0, water = 0, elapsed = 0, spawnTimer = 0;
+let buttons = [];   // clickable buttons on screen this frame
+const bucket = { x: CONFIG.BUCKET.startX, y: CONFIG.BUCKET.startY, full: false, held: false, dx: 0, dy: 0 };
+
+function reset() {
+  holes.length = 0; planks.length = 0;
+  repaired = 0; water = 0; elapsed = 0;
+  Object.assign(bucket, { x: CONFIG.BUCKET.startX, y: CONFIG.BUCKET.startY, full: false, held: false });
+  spawnTimer = interval;  // start full so the first hole appears right away
+}
+function startGame() { reset(); state = "playing"; }
+function toMenu() { reset(); state = "menu"; }
+
+// Is a hole at (x, y) with radius r touching the window?
+function onWindow(x, y, r) {
+  const w = CONFIG.WINDOW;
+  const nx = Math.max(w.x, Math.min(x, w.x + w.w));
+  const ny = Math.max(w.y, Math.min(y, w.y + w.h));
+  return Math.hypot(x - nx, y - ny) < r * 1.12 + 6;
+}
+
+function inWindow(x, y) {
+  const w = CONFIG.WINDOW;
+  return x >= w.x && x <= w.x + w.w && y >= w.y && y <= w.y + w.h;
+}
+
+function spawnHole() {
+  const maxR = Math.min(CONFIG.HOLE_RADIUS_MAX, CONFIG.PLANK_HEIGHT / 2 / 1.12);  // never bigger than a plank can cover
+  const r = rand(Math.min(CONFIG.HOLE_RADIUS_MIN, maxR), maxR);
+  const pad = CONFIG.EDGE_PADDING + r;
+  for (let tries = 0; tries < 100; tries++) {
+    const x = rand(pad, W - pad), y = rand(pad, H - pad);
+    if (onWindow(x, y, r)) continue;                                        // never on the window
+    if (holes.some(h => Math.hypot(h.x - x, h.y - y) < h.r + r)) continue;  // not on another open hole
+    holes.push({ x, y, r, born: performance.now() });  // may land on top of planks, that's fine
+    return;
+  }
+}
+
+function repair(hole) {
+  planks.push({
+    x: hole.x, y: hole.y,
+    w: CONFIG.PLANK_WIDTH, h: CONFIG.PLANK_HEIGHT,  // always the same size
+    angle: rand(0, Math.PI),  // random rotation
+  });
+  holes.splice(holes.indexOf(hole), 1);
+  repaired++;
+}
+
+/* ---------- input ---------- */
+function toGame(e) {
+  const box = canvas.getBoundingClientRect();
+  return { x: (e.clientX - box.left) * W / box.width, y: (e.clientY - box.top) * H / box.height };
+}
+function holeAt(p) {
+  for (let i = holes.length - 1; i >= 0; i--) {
+    if (Math.hypot(holes[i].x - p.x, holes[i].y - p.y) <= holes[i].r) return holes[i];
+  }
+  return null;
+}
+function buttonAt(p) {
+  return buttons.find(b => p.x >= b.x && p.x <= b.x + b.w && p.y >= b.y && p.y <= b.y + b.h) || null;
+}
+function overBucket(p) {
+  return Math.abs(p.x - bucket.x) <= CONFIG.BUCKET.w / 2 && Math.abs(p.y - bucket.y) <= CONFIG.BUCKET.h / 2;
+}
+canvas.addEventListener("pointerdown", e => {
+  const p = toGame(e);
+  if (state === "playing") {
+    if (overBucket(p)) {  // grab the bucket (it sits on top of holes)
+      bucket.held = true; bucket.dx = bucket.x - p.x; bucket.dy = bucket.y - p.y;
+      canvas.setPointerCapture(e.pointerId);
+    } else { const h = holeAt(p); if (h) repair(h); }
+  } else { const b = buttonAt(p); if (b) b.action(); }
+});
+canvas.addEventListener("pointermove", e => {
+  const p = toGame(e);
+  if (bucket.held) {
+    const bw = CONFIG.BUCKET.w / 2, bh = CONFIG.BUCKET.h / 2;
+    bucket.x = Math.max(bw, Math.min(W - bw, p.x + bucket.dx));
+    bucket.y = Math.max(bh, Math.min(H - bh, p.y + bucket.dy));
+  }
+  canvas.style.cursor = bucket.held ? "grabbing"
+    : state === "playing" ? (overBucket(p) ? "grab" : holeAt(p) ? "pointer" : "default")
+    : buttonAt(p) ? "pointer" : "default";
+});
+const drop = () => { bucket.held = false; };
+canvas.addEventListener("pointerup", drop);
+canvas.addEventListener("pointercancel", drop);
+
+// Draws an asset's image. If the asset has `frames` (a horizontal strip), it animates through them.
+function drawAsset(a, x, y, w, h) {
+  const n = a.frames || 1;
+  const fw = a.img.width / n;
+  const f = Math.floor(performance.now() / 1000 * (a.fps || 8)) % n;
+  ctx.drawImage(a.img, f * fw, 0, fw, a.img.height, x, y, w, h);
+}
+
+/* ---------- drawing ---------- */
+function drawBackground() {
+  const a = ASSETS.background;
+  if (a.img) { ctx.drawImage(a.img, 0, 0, W, H); return; }
+  ctx.fillStyle = a.color;
+  ctx.fillRect(0, 0, W, H);
+  if (a.showSeams) {
+    ctx.fillStyle = a.seamColor;
+    for (let y = 90; y < H; y += 90) ctx.fillRect(0, y - 2, W, 4);
+  }
+}
+
+function drawWindow() {
+  const a = ASSETS.window, w = CONFIG.WINDOW;
+  if (a.img) { drawAsset(a, w.x, w.y, w.w, w.h); return; }
+  ctx.fillStyle = a.color;
+  ctx.fillRect(w.x, w.y, w.w, w.h);
+  ctx.strokeStyle = a.frameColor; ctx.lineWidth = 10;
+  ctx.strokeRect(w.x, w.y, w.w, w.h);
+  ctx.strokeStyle = a.barColor; ctx.lineWidth = 6;  // cross bars
+  ctx.beginPath();
+  ctx.moveTo(w.x + w.w / 2, w.y); ctx.lineTo(w.x + w.w / 2, w.y + w.h);
+  ctx.moveTo(w.x, w.y + w.h / 2); ctx.lineTo(w.x + w.w, w.y + w.h / 2);
+  ctx.stroke();
+}
+
+function drawPlank(p) {
+  const a = ASSETS.plank;
+  ctx.save();
+  ctx.translate(p.x, p.y);
+  ctx.rotate(p.angle);
+  if (a.img) {
+    ctx.drawImage(a.img, -p.w / 2, -p.h / 2, p.w, p.h);
+  } else {
+    ctx.fillStyle = a.color;
+    ctx.fillRect(-p.w / 2, -p.h / 2, p.w, p.h);
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = a.edgeColor;
+    ctx.strokeRect(-p.w / 2, -p.h / 2, p.w, p.h);
+    ctx.fillStyle = a.nailColor;
+    for (const side of [-1, 1]) {  // a nail near each end
+      ctx.beginPath();
+      ctx.arc(side * (p.w / 2 - p.h * 0.25), 0, p.h * 0.07, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+  ctx.restore();
+}
+
+function drawHole(h) {
+  const a = ASSETS.hole;
+  const r = h.r * Math.min(1, (performance.now() - h.born) / 200);  // quick pop-in
+  if (a.img) { ctx.drawImage(a.img, h.x - r, h.y - r, r * 2, r * 2); return; }
+  ctx.fillStyle = a.rimColor;
+  ctx.beginPath(); ctx.arc(h.x, h.y, r * 1.12, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = a.color;
+  ctx.beginPath(); ctx.arc(h.x, h.y, r, 0, Math.PI * 2); ctx.fill();
+}
+
+function drawWater(t) {
+  if (water <= 0) return;
+  const a = ASSETS.water, top = H * (1 - water);
+  ctx.beginPath();  // water shape with a gently moving surface
+  ctx.moveTo(0, H);
+  for (let x = 0; x <= W; x += 20) ctx.lineTo(x, top + Math.sin(x * 0.02 + t * 0.002) * 4);
+  ctx.lineTo(W, H);
+  ctx.closePath();
+  if (a.img) { ctx.save(); ctx.clip(); ctx.globalAlpha = a.alpha ?? 1; drawAsset(a, 0, 0, W, H); ctx.restore(); }
+  else { ctx.fillStyle = a.color; ctx.fill(); }
+}
+
+function drawBucket() {
+  const a = bucket.full ? ASSETS.bucketFull : ASSETS.bucketEmpty, w = CONFIG.BUCKET.w, h = CONFIG.BUCKET.h;
+  if (a.img) { ctx.drawImage(a.img, bucket.x - w / 2, bucket.y - h / 2, w, h); return; }
+  ctx.beginPath();  // simple bucket: wide at the top, narrow at the bottom
+  ctx.moveTo(bucket.x - w / 2, bucket.y - h / 2); ctx.lineTo(bucket.x + w / 2, bucket.y - h / 2);
+  ctx.lineTo(bucket.x + w * 0.35, bucket.y + h / 2); ctx.lineTo(bucket.x - w * 0.35, bucket.y + h / 2);
+  ctx.closePath();
+  ctx.fillStyle = a.color; ctx.fill();
+  ctx.lineWidth = 4; ctx.strokeStyle = a.edgeColor; ctx.stroke();
+  ctx.fillStyle = bucket.full ? a.waterColor : a.insideColor;  // the opening: water inside when full
+  ctx.beginPath(); ctx.ellipse(bucket.x, bucket.y - h / 2, w / 2 - 6, 10, 0, 0, Math.PI * 2); ctx.fill();
+}
+
+function drawHud() {
+  ctx.fillStyle = ASSETS.ui.text;
+  ctx.font = ASSETS.ui.font;
+  ctx.textAlign = "left"; ctx.textBaseline = "top";
+  ctx.fillText("Repaired: " + repaired + "    Open holes: " + holes.length + "    Water: " + Math.round(water * 100) + "%", 20, 16);
+}
+
+function drawButton(label, y, action) {
+  const u = ASSETS.ui, w = 300, h = 64, x = W / 2 - w / 2;
+  ctx.fillStyle = u.buttonColor; ctx.fillRect(x, y - h / 2, w, h);
+  ctx.lineWidth = 4; ctx.strokeStyle = u.buttonEdge; ctx.strokeRect(x, y - h / 2, w, h);
+  ctx.fillStyle = u.buttonText; ctx.font = u.font;
+  ctx.fillText(label, W / 2, y);
+  buttons.push({ x, y: y - h / 2, w, h, action });
+}
+
+function drawOverlay() {  // main menu and game over screens
+  const u = ASSETS.ui;
+  ctx.fillStyle = u.overlay; ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillStyle = u.text;
+  if (state === "menu") {
+    ctx.font = u.titleFont; ctx.fillText(CONFIG.TITLE, W / 2, 120);
+    ctx.font = u.font; ctx.fillText(CONFIG.SUBTITLE, W / 2, 190);
+    drawButton("Play", 570, startGame);
+  } else {
+    ctx.font = u.titleFont; ctx.fillText("The ship sank!", W / 2, 120);
+    ctx.font = u.font;
+    ctx.fillText("Holes plugged: " + repaired + "    Time afloat: " + Math.floor(elapsed) + "s", W / 2, 190);
+    drawButton("Play again", 540, startGame);
+    drawButton("Main menu", 620, toMenu);
+  }
+}
+
+/* ---------- main loop ---------- */
+let last = performance.now();
+
+function update(dt) {
+  elapsed += dt / 1000;
+  spawnTimer += dt;
+  while (spawnTimer >= interval) { spawnTimer -= interval; spawnHole(); }
+  water += holes.length * CONFIG.WATER_RISE_PER_HOLE_PER_SEC * dt / 1000;
+
+  // Bucket: dragging it onto the window empties it. Touching the water fills it (and lowers the water).
+  if (inWindow(bucket.x, bucket.y)) {
+    if (bucket.full && bucket.held) bucket.full = false;  // only while being dragged, never when just sitting there
+  } else if (!bucket.full && water > 0 && bucket.y + CONFIG.BUCKET.h / 2 >= H * (1 - water)) {
+    bucket.full = true;
+    water = Math.max(0, water - CONFIG.BUCKET_WATER_AMOUNT);
+  }
+
+  if (water >= 1) { water = 1; bucket.held = false; state = "gameover"; }
+}
+
+function frame(now) {
+  const dt = Math.min(Math.max(now - last, 0), 100);  // clamp so a background tab doesn't flood holes
+  last = now;
+  if (state === "playing") update(dt);
+
+  buttons = [];
+  drawBackground();
+  planks.forEach(drawPlank);  // planks first (oldest to newest, so they stack)...
+  drawWindow();               // ...window stays visible on top of planks...
+  holes.forEach(drawHole);    // ...holes on top, so new holes can appear over planks...
+  drawWater(now);             // ...water over holes and planks...
+  drawBucket();               // ...bucket on top of everything
+  if (state === "playing") drawHud(); else drawOverlay();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
